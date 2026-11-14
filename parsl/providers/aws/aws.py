@@ -18,6 +18,10 @@ from parsl.version import VERSION
 
 logger = logging.getLogger(__name__)
 
+# Region used when none is passed and boto3 cannot resolve one from the
+# environment or the AWS config file.
+FALLBACK_REGION = 'us-east-2'
+
 try:
     import boto3
     from botocore.exceptions import ClientError, ProfileNotFound
@@ -103,9 +107,16 @@ class AWSProvider(ExecutionProvider, RepresentationMixin):
     instance_type : str
         EC2 instance type. Instance types comprise varying combinations of CPU, memory,
         storage, and networking capacity For more information on possible instance types,
-        see `here <https://aws.amazon.com/ec2/instance-types/>`_. Default is 't2.small'.
+        see `here <https://aws.amazon.com/ec2/instance-types/>`_. Default is 't3.small',
+        a current-generation, burstable x86_64 type offered in every commercial region.
+        The architecture of the AMI given by ``image_id`` must match the instance type
+        (for example, an arm64 AMI needs a Graviton type such as 't4g.small').
     region : str
-        Amazon Web Service (AWS) region to launch machines. Default is 'us-east-2'.
+        Amazon Web Service (AWS) region to launch machines. Default is None, which lets
+        boto3 resolve the region in its usual way: the ``AWS_DEFAULT_REGION`` environment
+        variable, then the ``region`` of the selected profile in the AWS config file. If
+        no region can be resolved, 'us-east-2' is used. After initialization this
+        attribute holds the region actually used.
     key_name : str
         Name of the AWS private key (.pem file) that is usually generated on the console
         to allow SSH access to the EC2 instances. This is mostly used for debugging.
@@ -156,8 +167,8 @@ class AWSProvider(ExecutionProvider, RepresentationMixin):
                  parallelism=1,
 
                  worker_init='',
-                 instance_type='t2.small',
-                 region='us-east-2',
+                 instance_type='t3.small',
+                 region=None,
                  spot_max_bid=0,
 
                  key_file=None,
@@ -384,23 +395,33 @@ class AWSProvider(ExecutionProvider, RepresentationMixin):
             creds = {_KEY_FILE_KEYS.get(k, k): v for k, v in creds.items()}
 
             logger.debug("EC2Provider '{}': Using credential file to create session".format(self.label))
-            session = boto3.session.Session(region_name=self.region, **creds)
+            session_kwargs = creds
         elif self.profile is not None:
             logger.debug("EC2Provider '{}': Using profile name to create session".format(self.label))
-            try:
-                session = boto3.session.Session(
-                    profile_name=self.profile, region_name=self.region
-                )
-            except ProfileNotFound as e:
-                raise ConfigurationError("AWS profile '{}' not found: {}".format(self.profile, e)) from e
+            session_kwargs = {'profile_name': self.profile}
         else:
             logger.debug("EC2Provider '{}': Using default credential chain to create session".format(self.label))
-            session = boto3.session.Session(region_name=self.region)
-            if session.get_credentials() is None:
-                raise ConfigurationError("No AWS credentials found. Specify 'profile' or 'key_file', "
-                                         "or configure credentials so that boto3 can find them, for example "
-                                         "with the AWS_PROFILE or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
-                                         "environment variables, ~/.aws/credentials, or an instance role.")
+            session_kwargs = {}
+
+        def make_session(region_name):
+            try:
+                return boto3.session.Session(region_name=region_name, **session_kwargs)
+            except ProfileNotFound as e:
+                raise ConfigurationError("AWS profile '{}' not found: {}".format(self.profile, e)) from e
+
+        # With region_name=None, boto3 resolves the region from the
+        # AWS_DEFAULT_REGION, then the profile in the AWS config file.
+        session = make_session(self.region)
+        if session.region_name is None:
+            logger.info("EC2Provider '{}': No AWS region configured; using {}".format(self.label, FALLBACK_REGION))
+            session = make_session(FALLBACK_REGION)
+        self.region = session.region_name
+
+        if self.key_file is None and self.profile is None and session.get_credentials() is None:
+            raise ConfigurationError("No AWS credentials found. Specify 'profile' or 'key_file', "
+                                     "or configure credentials so that boto3 can find them, for example "
+                                     "with the AWS_PROFILE or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
+                                     "environment variables, ~/.aws/credentials, or an instance role.")
 
         return session
 
